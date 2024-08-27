@@ -1,0 +1,13 @@
+[Unit]
+Description=VLC Sync
+After=network.target
+
+[Service]
+WorkingDirectory=/path/to/vlc-sync
+Environment="PATH=path/to/venv/bin"
+ExecStartPre=/bin/sleep 10
+ExecStart=python /path/to/vlc-sync/src/vlc-sync --config_file /path/to/vlc-sync/config.conf
+Restart=always
+
+[Install]
+WantedBy=default.target

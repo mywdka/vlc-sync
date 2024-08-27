@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+import os
+import time
+import struct
+import json
+import socket
+import argparse
+import configparser
+import threading
+import signal
+import sys
+
+import vlc
+from colorama import Fore
+
+PORT = 1666
+TIMEOUT = 5
+MARGIN = 0.010
+
+
+class ArgumentParser:
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(
+            description="Argument Parser with Config File Support"
+        )
+        self.parser.add_argument(
+            "--config_file",
+            help="Path to the config file",
+            required=True,
+        )
+
+    def _validate_video_path(self, video_path):
+        if video_path is None or not os.path.isfile(video_path):
+            self.parser.error("Invalid video path: File does not exist.")
+
+    def parse_args(self):
+        args = self.parser.parse_args()
+
+        if args.config_file:
+            config = configparser.ConfigParser()
+            config.read(args.config_file)
+
+            if "video" in config:
+                if "file_name" in config["video"]:
+                    args.video_path = config["video"]["file_name"]
+            if "audio" in config:
+                if "output" in config["audio"]:
+                    args.audio_device = config["audio"]["output"]
+            if "options" in config:
+                if "destination" in config["options"]:
+                    args.destination = config["options"]["destination"]
+                if "verbose" in config["options"]:
+                    args.verbose = config.getboolean("options", "verbose")
+                if "conductor" in config["options"]:
+                    args.conductor = config.getboolean("options", "conductor")
+
+        self._validate_video_path(args.video_path)
+
+        return args
+
+
+class Logger:
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+        self.prefix = ""
+
+    def set_prefix(self, prefix):
+        self.prefix = prefix
+
+    def info(self, message):
+        print(f"{Fore.GREEN}[INFO]{Fore.RESET} {self.prefix} {message}")
+
+    def debug(self, message):
+        if not self.verbose:
+            return
+        print(f"{Fore.BLUE}[DEBUG]{Fore.RESET} {self.prefix} {message}")
+
+    def warning(self, message):
+        print(f"{Fore.YELLOW}[WARNING]{Fore.RESET} {self.prefix} {message}")
+
+    def error(self, message):
+        print(f"{Fore.RED}[ERROR]{Fore.RESET} {self.prefix} {message}")
+
+
+class VLCPlayerSync:
+    def __init__(self):
+        self.parser = ArgumentParser()
+        self.args = self.parser.parse_args()
+        self.logger = Logger(verbose=self.args.verbose)
+        self.sock = self._init_socket()
+        self.instance = vlc.Instance()
+        self.player = self.instance.media_player_new()
+        self.media = self.instance.media_new(self.args.video_path)
+        self.player.set_media(self.media)
+        self.audio_devices = []
+        self.position_follower = 0.0
+        self.position_conductor = 0.0
+        self.play_thread = None
+        self.loop_thread = None
+        self.shutdown = False
+
+    def _init_socket(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+        sock.bind(("0.0.0.0", PORT))
+        return sock
+
+    def _socket_enable_broadcast(self):
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    def _socket_connect(self, destination):
+        while True:
+            try:
+                self.sock.connect((destination, PORT))
+                self.logger.info(f"Successfully connected to the vlc-sync network on: {destination}:{PORT}.")
+                break
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to connect to the vlc-sync network: {str(e)}"
+                )
+                self.logger.error(f"Retrying in {TIMEOUT} seconds...")
+                time.sleep(TIMEOUT)
+
+    def _read_position_conductor(self):
+        data = self.sock.recv(1024)
+        self.position_conductor = struct.unpack("f", data)[0]
+
+    def _signal_handler(self, _signum, _frame):
+        self.shutdown = True
+        # HACK: workaround for threads not closing properly
+        sys.exit(1)
+
+    def _play(self):
+        self.logger.info(f"Playing video: {self.args.video_path}")
+        self.player.play()
+
+    def _video_loop(self):
+        while not self.shutdown:
+            state = self.player.get_state()
+            if state == vlc.State.Ended:
+                self.player.set_media(self.media)
+                self.player.play()
+
+    def _set_audio_device(self):
+        audio_devices = self.player.audio_output_device_enum()
+
+        i = 0
+        while audio_devices:
+            device_name = audio_devices.contents.device
+            description = audio_devices.contents.description
+
+            self.audio_devices.append(device_name.decode('utf-8'))
+            audio_devices = audio_devices.contents.next
+
+            i += 1
+
+
+        selected_device = None
+
+        for device in self.audio_devices:
+            if self.args.audio_device in device:
+                selected_device = device
+                break
+
+        print(selected_device)
+        self.player.audio_output_device_set(None, selected_device)
+
+    def _conductor_loop(self):
+        while not self.shutdown:
+            try:
+                pos = self.player.get_position()
+
+                data = {
+                    "video_file": self.args.video_path,
+                    "pos": pos,
+                }
+                json_data = json.dumps(data)
+
+                self.sock.send(json_data.encode("utf-8"))
+                self.logger.debug(f"Conductor pos: {pos}")
+
+                time.sleep(0.5)
+            except socket.error as e:
+                self.logger.error(e)
+                pass
+
+    def _follower_loop(self):
+        while not self.shutdown:
+            try:
+                socket_data = self.sock.recv(1024).decode("utf-8")
+                data = json.loads(socket_data)
+
+                if self.args.video_path != data["video_file"]:
+                    self.logger.error(
+                        f"The conductor video {data['video_file']} does not match the follower video {self.args.video_path}"
+                    )
+                    self.shutdown = True
+                    break
+
+                video_file = data["video_file"]
+                self.logger.debug(f"Conductor is playing: {video_file}")
+
+                self.position_conductor = data["pos"]
+                self.position_follower = self.player.get_position()
+
+                diff = self.position_follower - self.position_conductor
+
+                if not (-MARGIN <= diff <= MARGIN):
+                    self.logger.info(
+                        f"Jump to {round(self.position_conductor * 100, 2)}%"
+                    )
+                    self.player.set_position(self.position_conductor)
+
+            except Exception as e:
+                self.logger.error(e)
+                pass
+
+    def run(self):
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+        self._play()
+        self._set_audio_device()
+
+        self.loop_thread = threading.Thread(target=self._video_loop)
+        self.loop_thread.start()
+
+        if self.args.conductor:
+            self._socket_enable_broadcast()
+            self._socket_connect(self.args.destination)
+            self.conductor_thread = threading.Thread(target=self._conductor_loop)
+            self.conductor_thread.start()
+            self.conductor_thread.join()
+        else:
+            self.follower_thread = threading.Thread(target=self._follower_loop)
+            self.follower_thread.start()
+            self.follower_thread.join()
+
+        self.loop_thread.join()
+
+
+if __name__ == "__main__":
+    VLCPlayerSync().run()

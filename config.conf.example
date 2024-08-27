@@ -1,0 +1,10 @@
+[video]
+file_name = synctest.mp4
+
+[audio]
+output = analog
+
+[options]
+verbose = True
+conductor = True
+destination = 172.24.1.255
